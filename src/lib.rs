@@ -1,11 +1,12 @@
 //! gray-repguard — a repetition guard for tool calls.
 //!
 //! Port of hermes' `agent/repetition_guard.py` idea, applied to tool calls:
-//! `tool/before` hashes (name, canonicalized-args) and keeps a sliding
-//! window of recent call hashes per session. When the SAME call appears
-//! `REPGUARD_MAX_REPEATS` (default 3) times inside `REPGUARD_WINDOW_SECS`
-//! (default 600), `tool/after` appends a "you are looping, change approach"
-//! nudge to that call's result.
+//! `tool/before` hashes (name, canonicalized-args) and counts consecutive
+//! repeats per session. When the same call runs `REPGUARD_MAX_REPEATS`
+//! (default 3) times in a row, `tool/after` appends a "you are looping,
+//! change approach" nudge to that call's result. A different call — or a
+//! gap longer than `REPGUARD_WINDOW_SECS` (default 600) — resets the run,
+//! so interleaved iteration never trips the guard.
 //!
 //! Canonicalization sorts object keys recursively before hashing, so
 //! `{"a":1,"b":2}` and `{"b":2,"a":1}` count as the same call.
@@ -30,7 +31,7 @@ fn manifest() -> Value {
     })
 }
 
-/// Identical-call count inside the window that triggers the nudge.
+/// Consecutive identical calls that trigger the nudge.
 fn max_repeats() -> usize {
     std::env::var("REPGUARD_MAX_REPEATS")
         .ok()
@@ -39,7 +40,7 @@ fn max_repeats() -> usize {
         .unwrap_or(3)
 }
 
-/// Sliding window for counting repeats.
+/// Sliding window for tracked calls; also the run-staleness cutoff.
 fn window() -> Duration {
     Duration::from_secs(
         std::env::var("REPGUARD_WINDOW_SECS")
@@ -83,17 +84,20 @@ fn session_key(params: &Value) -> String {
         .to_string()
 }
 
-/// Per-session sliding window of recent call hashes, plus the flag the
-/// last `tool/before` raised for `tool/after` to pick up.
+/// Per-session sliding window of recent call hashes, the consecutive-run
+/// counter, and the flag the last `tool/before` raised for `tool/after`.
 #[derive(Default)]
 struct Sess {
     calls: VecDeque<(u64, Instant)>,
-    flag: Option<usize>, // repeat count that triggered the nudge
+    last: Option<(u64, Instant)>, // hash+time of the previous call
+    run: usize,                   // consecutive repeats of that hash
+    flag: Option<usize>,          // run length that armed the nudge
 }
 
 type State = std::sync::Mutex<HashMap<String, Sess>>;
 
-/// Count appearances of `h` in the window after recording this call.
+/// Record this call and return its run length: the run only grows when the
+/// immediately preceding call had the same hash within `win`.
 fn record(sess: &mut Sess, h: u64, win: Duration) -> usize {
     let now = Instant::now();
     while sess
@@ -104,7 +108,12 @@ fn record(sess: &mut Sess, h: u64, win: Duration) -> usize {
         sess.calls.pop_front();
     }
     sess.calls.push_back((h, now));
-    sess.calls.iter().filter(|(x, _)| *x == h).count()
+    sess.run = match sess.last {
+        Some((lh, lt)) if lh == h && now.duration_since(lt) <= win => sess.run + 1,
+        _ => 1,
+    };
+    sess.last = Some((h, now));
+    sess.run
 }
 
 fn tool_before(state: &State, params: &Value) -> Value {
@@ -114,8 +123,8 @@ fn tool_before(state: &State, params: &Value) -> Value {
     let key = session_key(params);
     let mut guard = state.lock().expect("state");
     let sess = guard.entry(key).or_default();
-    let count = record(sess, h, window());
-    sess.flag = (count >= max_repeats()).then_some(count);
+    let run = record(sess, h, window());
+    sess.flag = (run >= max_repeats()).then_some(run);
     json!({"decision": "allow"})
 }
 
@@ -125,16 +134,15 @@ fn tool_after(state: &State, params: &Value) -> Value {
     let Some(sess) = guard.get_mut(&key) else {
         return json!({});
     };
-    let Some(count) = sess.flag.take() else {
+    let Some(run) = sess.flag.take() else {
         return json!({});
     };
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let content = params.get("content").and_then(Value::as_str).unwrap_or("");
     let nudge = format!(
-        "\n\n[repguard] `{name}` has now run {count} times with identical arguments \
-         in the last {}s — you are looping. Change approach: use different \
-         arguments, a different tool, or stop and report what is blocking you.",
-        window().as_secs()
+        "\n\n[repguard] `{name}` has now run {run} times in a row with identical \
+         arguments — you are looping. Change approach: use different \
+         arguments, a different tool, or stop and report what is blocking you."
     );
     json!({ "content": format!("{content}{nudge}") })
 }
@@ -143,22 +151,19 @@ fn run_command(argv: &[&str], params: &Value, state: &State) -> String {
     if argv.first().copied() == Some("status") || argv.is_empty() {
         let key = session_key(params);
         let guard = state.lock().expect("state");
-        let mut counts: HashMap<u64, usize> = HashMap::new();
-        if let Some(sess) = guard.get(&key) {
-            for (h, _) in &sess.calls {
-                *counts.entry(*h).or_default() += 1;
-            }
-        }
-        let max = counts.values().max().copied().unwrap_or(0);
+        let (tracked, run) = guard
+            .get(&key)
+            .map(|s| (s.calls.len(), s.run))
+            .unwrap_or((0, 0));
         return format!(
-            "gray-repguard {} — nudge at {} identical calls / {}s window \
-             (env REPGUARD_MAX_REPEATS, REPGUARD_WINDOW_SECS)\n\
-             this session: {} calls tracked, hottest repeat {}x",
+            "gray-repguard {} — nudge at {} identical calls in a row / {}s \
+             window (env REPGUARD_MAX_REPEATS, REPGUARD_WINDOW_SECS)\n\
+             this session: {} calls tracked, current run {}x",
             env!("CARGO_PKG_VERSION"),
             max_repeats(),
             window().as_secs(),
-            guard.get(&key).map(|s| s.calls.len()).unwrap_or(0),
-            max,
+            tracked,
+            run,
         );
     }
     "usage: /repguard [status]".into()
@@ -236,6 +241,14 @@ mod tests {
         json!({"id": "s1", "cwd": "/tmp"})
     }
 
+    fn before(state: &State, name: &str, args: Value) -> Value {
+        call(state, "tool/before", json!({"name":name,"args":args,"session":sess()}))
+    }
+
+    fn after(state: &State, name: &str, content: &str) -> Value {
+        call(state, "tool/after", json!({"name":name,"content":content,"session":sess()}))
+    }
+
     #[test]
     fn manifest_claims_hooks() {
         let m = manifest();
@@ -254,50 +267,54 @@ mod tests {
     }
 
     #[test]
-    fn nudge_after_threshold() {
+    fn consecutive_calls_nudge() {
         let state: State = std::sync::Mutex::new(HashMap::new());
         let args = json!({"cmd": "ls"});
-        for _ in 0..max_repeats() {
-            let r = call(&state, "tool/before", json!({"name":"bash","args":args,"session":sess()}));
+        for i in 0..max_repeats() {
+            let r = before(&state, "bash", args.clone());
             assert_eq!(r["decision"], "allow");
+            let r = after(&state, "bash", "out");
+            assert_eq!(
+                r["content"].as_str().is_some_and(|c| c.contains("you are looping")),
+                i + 1 == max_repeats()
+            );
         }
-        let r = call(
-            &state,
-            "tool/after",
-            json!({"name":"bash","content":"out","is_error":false,"session":sess()}),
-        );
-        assert!(r["content"].as_str().unwrap().contains("you are looping"));
-        // flag consumed: next after call passes through untouched
-        let r = call(
-            &state,
-            "tool/after",
-            json!({"name":"bash","content":"out","is_error":false,"session":sess()}),
-        );
-        assert_eq!(r, json!({}));
+        // flag consumed: a stray after with no new before stays untouched
+        assert_eq!(after(&state, "bash", "out"), json!({}));
+    }
+
+    #[test]
+    fn interleaved_calls_no_nudge() {
+        // The reported false positive: re-running the same command between
+        // edits — A-edit-A-edit-A — is iteration, not a loop.
+        let state: State = std::sync::Mutex::new(HashMap::new());
+        let render = json!({"cmd": "render chart && open chart.png"});
+        for i in 0..max_repeats() {
+            before(&state, "bash", render.clone());
+            assert_eq!(after(&state, "bash", "out"), json!({}));
+            before(&state, "edit", json!({"file": "chart.py", "n": i}));
+            assert_eq!(after(&state, "edit", "ok"), json!({}));
+        }
     }
 
     #[test]
     fn different_args_do_not_nudge() {
         let state: State = std::sync::Mutex::new(HashMap::new());
         for i in 0..max_repeats() + 2 {
-            call(&state, "tool/before", json!({"name":"bash","args":{"cmd":i},"session":sess()}));
+            before(&state, "bash", json!({"cmd": i}));
+            assert_eq!(after(&state, "bash", "out"), json!({}));
         }
-        let r = call(
-            &state,
-            "tool/after",
-            json!({"name":"bash","content":"out","session":sess()}),
-        );
-        assert_eq!(r, json!({}));
     }
 
     #[test]
     fn window_prunes_old_calls() {
         let mut s = Sess::default();
-        let h = 7u64;
         let old = Instant::now() - Duration::from_secs(9999);
-        s.calls.push_back((h, old));
-        let count = record(&mut s, h, window());
-        assert_eq!(count, 1);
+        s.calls.push_back((7, old));
+        s.last = Some((7, old));
+        s.run = 5;
+        // stale gap: window entry pruned, run restarts at 1
+        assert_eq!(record(&mut s, 7, window()), 1);
     }
 
     #[test]
