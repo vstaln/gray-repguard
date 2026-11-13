@@ -27,6 +27,7 @@ fn manifest() -> Value {
         "protocol": "2.0",
         "tools": [],
         "commands": ["/repguard"],
+        "command_descriptions": {"/repguard": "show the repeated-call guard status"},
         "hooks": ["tool/before", "tool/after"],
     })
 }
