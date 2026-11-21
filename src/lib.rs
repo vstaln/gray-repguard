@@ -231,9 +231,12 @@ mod tests {
     use super::*;
 
     fn call(state: &State, method: &str, params: Value) -> Value {
-        handle(&json!({ "id": 1, "method": method, "params": params }), state)
-            .0
-            .unwrap()["result"]
+        handle(
+            &json!({ "id": 1, "method": method, "params": params }),
+            state,
+        )
+        .0
+        .unwrap()["result"]
             .clone()
     }
 
@@ -242,11 +245,19 @@ mod tests {
     }
 
     fn before(state: &State, name: &str, args: Value) -> Value {
-        call(state, "tool/before", json!({"name":name,"args":args,"session":sess()}))
+        call(
+            state,
+            "tool/before",
+            json!({"name":name,"args":args,"session":sess()}),
+        )
     }
 
     fn after(state: &State, name: &str, content: &str) -> Value {
-        call(state, "tool/after", json!({"name":name,"content":content,"session":sess()}))
+        call(
+            state,
+            "tool/after",
+            json!({"name":name,"content":content,"session":sess()}),
+        )
     }
 
     #[test]
@@ -275,7 +286,9 @@ mod tests {
             assert_eq!(r["decision"], "allow");
             let r = after(&state, "bash", "out");
             assert_eq!(
-                r["content"].as_str().is_some_and(|c| c.contains("you are looping")),
+                r["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("you are looping")),
                 i + 1 == max_repeats()
             );
         }
